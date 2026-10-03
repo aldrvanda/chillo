@@ -18,6 +18,9 @@ Chillo adalah aplikasi web berbasis Next.js yang membantu pengguna memantau masa
 10. [Cara Kerja Notifikasi](#cara-kerja-notifikasi)
 11. [Cara Kerja Laporan (Reports)](#cara-kerja-laporan-reports)
 12. [Panduan Konsistensi UI](#panduan-konsistensi-ui)
+13. [Testing](#testing)
+14. [Deploy ke Vercel](#deploy-ke-vercel)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -27,12 +30,14 @@ Chillo adalah aplikasi web berbasis Next.js yang membantu pengguna memantau masa
 |---|---|
 | Framework | Next.js (App Router) |
 | Bahasa | TypeScript |
-| Database | MongoDB (via custom `lib/db.ts`) |
+| Database | MongoDB Atlas, driver `mongodb` v7 (via `lib/db.js`) |
 | Styling | Tailwind CSS + inline styles |
 | Font | Poppins (Google Fonts) |
 | Charts | Recharts |
-| Icons | Icons8 (CDN) |
+| Icons | Icons8 (CDN) + lucide-react |
 | Auth | Cookie session (`chillo_session`, httpOnly) |
+| AI (opsional) | Anthropic Claude API untuk generate resep |
+| Testing | Jest + ts-jest + mongodb-memory-server |
 
 ---
 
@@ -42,9 +47,8 @@ Chillo adalah aplikasi web berbasis Next.js yang membantu pengguna memantau masa
 # 1. Install dependencies
 npm install
 
-# 2. Buat file environment
-cp .env.example .env.local
-# Isi MONGODB_URI (lihat bagian Variabel Lingkungan)
+# 2. Buat file .env.local di root project
+#    Isi DB_URI (lihat bagian Variabel Lingkungan)
 
 # 3. Jalankan dev server
 npm run dev
@@ -59,9 +63,32 @@ npm run dev
 Buat file `.env.local` di root project (sejajar dengan `package.json`):
 
 ```env
-# Wajib — koneksi MongoDB Atlas atau lokal
-MONGODB_URI=mongodb+srv://<user>:<password>@cluster.mongodb.net/chillo
+# Wajib — connection string MongoDB Atlas
+DB_URI="mongodb+srv://<user>:<password>@<cluster>.mongodb.net/?retryWrites=true&w=majority"
+
+# Opsional — hanya untuk endpoint POST /api/generate-recipes
+ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+| Variabel | Wajib | Keterangan |
+|---|---|---|
+| `DB_URI` | Ya | Connection string MongoDB. Aplikasi akan error saat start jika kosong. |
+| `ANTHROPIC_API_KEY` | Tidak | Dipakai untuk generate resep dengan AI. |
+
+Catatan:
+- Nama database **tidak** diambil dari URI. Semua data selalu disimpan di database `smartFridge_DB` (di-hardcode di `lib/db.js`).
+- Collection (`users`, `sessions`, `inventory`, dll.) dibuat otomatis oleh MongoDB saat pertama kali ada data masuk, jadi tidak perlu dibuat manual.
+- Jika password user database mengandung karakter `@ : / ? # %`, encode dulu (misal `@` → `%40`) atau ganti password dengan huruf & angka saja.
+
+### Membuat database baru di MongoDB Atlas
+
+1. Login ke [cloud.mongodb.com](https://cloud.mongodb.com) → **Create** cluster → pilih **M0 (Free)**, region terdekat (mis. Singapore).
+2. **Database Access** → buat database user (username + password).
+3. **Network Access** → **Add IP Address** → **Allow Access from Anywhere** (`0.0.0.0/0`). Wajib agar Vercel bisa terhubung.
+4. **Connect → Drivers → Node.js** → salin connection string, ganti `<db_password>` dengan password user.
+5. Tempel ke `DB_URI` di `.env.local`, lalu restart `npm run dev`.
+
+Opsional: install extension **MongoDB for VS Code**, lalu `Ctrl+Shift+P` → *MongoDB: Connect* → *Connect with Connection String* untuk melihat isi database langsung dari VS Code.
 
 ---
 
@@ -71,6 +98,8 @@ MONGODB_URI=mongodb+srv://<user>:<password>@cluster.mongodb.net/chillo
 chillo/
 ├── app/
 │   ├── api/
+│   │   ├── generate-recipes/
+│   │   │   └── route.ts          POST generate resep dari inventaris via Claude AI
 │   │   ├── inventory/
 │   │   │   ├── route.ts          GET semua item, POST item baru
 │   │   │   └── [id]/route.ts     PUT edit, DELETE hapus (+ log waste)
@@ -100,40 +129,38 @@ chillo/
 │   └── ui/
 │       ├── StatusBadge.tsx       Badge Expired / Xd left / Safe
 │       └── StatusBar.tsx         Progress bar warna berdasarkan status
-└── lib/
-    ├── db.ts                     Koneksi MongoDB singleton
-    ├── actions.ts                Server actions: login, signup, logout
-    └── dateUtils.ts              ⚠️ SUMBER KEBENARAN kalkulasi tanggal
+├── lib/
+│   ├── db.js                     Koneksi MongoDB (cached, auto-retry jika gagal)
+│   ├── actions.ts                Server actions: login, signup, logout, getSession
+│   └── data.ts                   Tipe data + data contoh (mock)
+├── unit_dateUtils.test.ts        Unit test logika tanggal & status
+├── integration_api.test.ts       Integration test logika API + MongoDB in-memory
+└── jest.config.ts
 ```
 
 ---
 
 ## Aturan Penting: Kalkulasi Tanggal
 
-> **Semua kalkulasi kadaluarsa WAJIB menggunakan fungsi dari `lib/dateUtils.ts`.**  
-> Jangan buat fungsi kalkulasi tanggal baru di page atau API manapun.
+> **Jangan parse tanggal kadaluarsa dengan `new Date("YYYY-MM-DD")`.**
+> Selalu pecah string `YYYY-MM-DD` menjadi tahun/bulan/hari lalu hitung selisih hari kalender.
 
 ### Mengapa ini penting?
 
 `new Date("2025-06-10")` di JavaScript mem-parse string sebagai **UTC midnight**, bukan local midnight. Di server dengan timezone UTC+7, ini berarti item yang expired tanggal 10 Juni akan terdeteksi sebagai expired sejak pukul 00:00 UTC = 07:00 WIB tanggal 10 Juni. Ini menyebabkan status yang salah antar halaman.
 
-### Fungsi yang tersedia
+### Lokasi fungsi
 
-```typescript
-import { calcDaysLeft, getStatus, expiryLabel, notifExpiryPhrase } from '@/lib/dateUtils'
+Belum ada modul tanggal bersama — `calcDaysLeft` (dan `getStatus`) didefinisikan di masing-masing file berikut dan **logikanya harus dijaga tetap identik**:
 
-// Hitung sisa hari (negatif = sudah expired)
-const daysLeft = calcDaysLeft("2025-06-10")  // contoh hasil: -2 jika hari ini 12 Juni
+| File | Fungsi |
+|---|---|
+| `app/dashboard/page.tsx` | `calcDaysLeft(exp)`, `getStatus(d)` |
+| `app/inventory/page.tsx` | `calcDaysLeft(exp)`, `getStatus(d)` |
+| `app/api/notifications/route.ts` | `calcDaysLeft(exp, todayStr)` |
+| `app/api/reports/route.ts` | `calcDaysLeft(exp, todayStr)` |
 
-// Status bucket (konsisten di semua page)
-const status = getStatus(daysLeft)           // 'expired' | 'almost' | 'safe'
-
-// Label untuk UI Priority Attention
-const label = expiryLabel(daysLeft, status)  // "Expired 2 days ago"
-
-// Frasa untuk judul notifikasi
-const phrase = notifExpiryPhrase(daysLeft)   // "expires tomorrow"
-```
+Jika mengubah threshold atau cara hitung di salah satu file, ubah juga di file lainnya serta salinannya di `unit_dateUtils.test.ts`.
 
 ### Threshold status
 
@@ -263,6 +290,7 @@ Ketika DELETE dengan `reason: "Spoiled / Discarded"`, server otomatis:
 | GET | `/api/recipes` | Ambil semua resep tersimpan milik user |
 | POST | `/api/recipes` | Simpan resep baru |
 | DELETE | `/api/recipes/[id]` | Hapus resep milik user |
+| POST | `/api/generate-recipes` | Generate resep dari 10 item yang paling dekat kadaluarsa via Claude AI, lalu simpan ke `recipes` dengan `source: "ai"`. Butuh `ANTHROPIC_API_KEY`. Belum dipanggil dari UI. |
 
 ### Profil
 
@@ -388,7 +416,7 @@ Di-upsert otomatis oleh `GET /api/notifications`.
   "image": "string (base64 data URL) | null",
   "ingredients": "string[]",
   "steps": "string[]",
-  "source": "manual",
+  "source": "manual | ai",
   "createdAt": "Date"
 }
 ```
@@ -396,6 +424,8 @@ Di-upsert otomatis oleh `GET /api/notifications`.
 ---
 
 ## Cara Kerja Autentikasi
+
+> Login & sign up membutuhkan koneksi database yang aktif. Jika `DB_URI` salah atau cluster tidak bisa dihubungi, form akan menampilkan *"Something went wrong. Please try again."* — lihat [Troubleshooting](#troubleshooting).
 
 1. User mengisi form login/signup di `/login`.
 2. Form di-submit via **Server Action** (`loginAction` / `signupAction` di `lib/actions.ts`).
@@ -405,12 +435,18 @@ Di-upsert otomatis oleh `GET /api/notifications`.
 6. Setiap API route memvalidasi sesi dengan mengecek token dari cookie ke collection `sessions`.
 7. Logout menghapus record dari `sessions` dan menghapus cookie.
 
+### Koneksi database (`lib/db.js`)
+
+- Promise koneksi `MongoClient` di-cache (di `global` saat development agar tidak membuat koneksi baru setiap hot reload).
+- Jika koneksi gagal, cache dibuang sehingga request berikutnya otomatis mencoba konek ulang — tidak perlu restart server.
+- Saat development, resolver DNS Node diarahkan ke DNS publik (`8.8.8.8`, `1.1.1.1`) karena DNS lokal (mis. `127.0.0.1` dari VPN/antivirus) sering menolak lookup SRV yang dibutuhkan URI `mongodb+srv://`.
+
 ---
 
 ## Cara Kerja Notifikasi
 
 1. Setiap kali Navbar di-mount atau route berubah, Navbar melakukan fetch ke `GET /api/notifications`.
-2. Server mem-parse setiap item inventaris menggunakan `calcDaysLeft()` dari `lib/dateUtils.ts`.
+2. Server mem-parse setiap item inventaris menggunakan `calcDaysLeft()` (didefinisikan di `app/api/notifications/route.ts`).
 3. Untuk item expired/expiring, server melakukan **upsert** ke collection `notifications` dengan `$setOnInsert: { read: false }` — status `read: true` yang sudah ada tidak ditimpa.
 4. Untuk item yang sudah aman kembali (misalnya tanggal diubah), notifnya dihapus dari DB.
 5. Navbar menghitung `unreadCount` dari response dan menampilkan badge merah.
@@ -498,3 +534,39 @@ Class animasi tersedia di `globals.css`:
 - `animate-slide-up` — fade + geser dari bawah
 - `stagger-1` hingga `stagger-4` — delay bertahap untuk efek cascade
 - `animate-pulse` — skeleton loading state
+
+---
+
+## Testing
+
+Test berada di root project dan **tidak** mengimport kode dari `app/` atau `lib/` — fungsi yang diuji disalin inline, jadi test harus diperbarui jika source berubah.
+
+```bash
+npx jest                    # semua test
+npx jest unit_dateUtils     # unit test logika tanggal & status
+npx jest integration_api    # integration test dengan MongoDB in-memory
+npx jest --coverage         # dengan laporan coverage (folder coverage/)
+```
+
+---
+
+## Deploy ke Vercel
+
+1. Import repository ke Vercel.
+2. **Settings → Environment Variables** → tambahkan `DB_URI` (dan `ANTHROPIC_API_KEY` jika dipakai).
+3. Pastikan **Network Access** di MongoDB Atlas berisi `0.0.0.0/0`, karena IP Vercel selalu berubah.
+4. Setiap kali `DB_URI` diganti, lakukan **Redeploy** agar nilai baru terbaca.
+
+---
+
+## Troubleshooting
+
+| Gejala / Log | Penyebab | Solusi |
+|---|---|---|
+| Login/sign up gagal: *"Something went wrong"*, log `[MongoDB] Connection error` | Server tidak bisa terhubung ke MongoDB | Lihat pesan error di terminal, cocokkan dengan baris di bawah. |
+| `getaddrinfo ENOTFOUND ac-xxxx...mongodb.net` | Cluster di `DB_URI` sudah dihapus / alamat salah | Buat cluster baru (lihat [Variabel Lingkungan](#variabel-lingkungan)) dan ganti `DB_URI`. |
+| `querySrv ECONNREFUSED _mongodb._tcp...` | DNS lokal menolak lookup SRV | Sudah ditangani otomatis di `lib/db.js` saat development (`npm run dev`). |
+| `MongoServerSelectionError` / timeout | IP tidak diizinkan di Atlas | Tambahkan IP (atau `0.0.0.0/0`) di **Network Access**. |
+| `bad auth : authentication failed` | Username/password salah di `DB_URI` | Reset password di **Database Access**, perbarui `DB_URI`. |
+| `MongoDB URI not found` saat start | `DB_URI` belum diset | Isi `DB_URI` di `.env.local` (lokal) atau Environment Variables (Vercel). |
+| Perubahan `.env.local` tidak berpengaruh | Env hanya dibaca saat server start | Hentikan `npm run dev` (Ctrl+C) lalu jalankan lagi. |
